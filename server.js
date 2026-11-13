@@ -1,202 +1,301 @@
 import express from "express";
-import { google } from "googleapis";
+import crypto from "node:crypto";
 import { Readable } from "node:stream";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { google } from "googleapis";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: false, limit: "2mb" }));
 
 const PORT = Number(process.env.PORT || 10000);
-const MCP_ACCESS_TOKEN = process.env.MCP_ACCESS_TOKEN;
+const BASE_URL = (process.env.PUBLIC_BASE_URL || "https://epicrush-youtube-mcp.onrender.com").replace(/\/+$/, "");
+const MCP_RESOURCE = `${BASE_URL}/mcp`;
+const OAUTH_SECRET = process.env.MCP_OAUTH_SIGNING_SECRET;
+const ADMIN_PASSWORD = process.env.MCP_OAUTH_ADMIN_PASSWORD;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const YOUTUBE_REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN;
 
-function html(message) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EpicRush setup</title></head><body style="font-family:system-ui;max-width:760px;margin:40px auto;padding:0 18px;line-height:1.5">${message}</body></html>`;
+if (!OAUTH_SECRET || OAUTH_SECRET.length < 32) {
+  console.error("Missing/weak MCP_OAUTH_SIGNING_SECRET (use a random value of at least 32 characters).");
+  process.exit(1);
 }
 
-function getOAuthClient(redirectUri) {
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-    throw new Error("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in the hosting environment first.");
-  }
-  return new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, redirectUri);
+const clients = new Map();
+const pendingAuthorizations = new Map();
+const authorizationCodes = new Map();
+
+const b64u = (value) => Buffer.from(value).toString("base64url");
+const safeEqual = (a, b) => {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aa = Buffer.from(a), bb = Buffer.from(b);
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+};
+const signJwt = (payload) => {
+  const header = b64u(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const body = b64u(JSON.stringify(payload));
+  const input = `${header}.${body}`;
+  const sig = crypto.createHmac("sha256", OAUTH_SECRET).update(input).digest("base64url");
+  return `${input}.${sig}`;
+};
+const verifyJwt = (token) => {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) return null;
+  const input = `${parts[0]}.${parts[1]}`;
+  const expected = crypto.createHmac("sha256", OAUTH_SECRET).update(input).digest("base64url");
+  if (!safeEqual(parts[2], expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) return null;
+    if (payload.aud !== MCP_RESOURCE) return null;
+    return payload;
+  } catch { return null; }
+};
+const oauthError = (res, error, description, status = 400) =>
+  res.status(status).json({ error, error_description: description });
+
+function getOAuthClient() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) throw new Error("Google OAuth environment variables are missing.");
+  return new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    `${BASE_URL}/google/callback`
+  );
 }
 
-function getRedirectUri(req) {
-  const proto = req.headers["x-forwarded-proto"] || req.protocol;
-  return `${proto}://${req.get("host")}/google/callback`;
-}
+app.get("/", (_req, res) => res.type("text").send("EpicRush YouTube MCP is running."));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "epicrush-youtube-mcp" }));
 
-function youtubeClient() {
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !YOUTUBE_REFRESH_TOKEN) {
-    throw new Error("YouTube is not connected yet. Set the Google OAuth values and YOUTUBE_REFRESH_TOKEN in the hosting environment.");
-  }
-  const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  auth.setCredentials({ refresh_token: YOUTUBE_REFRESH_TOKEN });
-  return google.youtube({ version: "v3", auth });
-}
+// OAuth 2.1 discovery for Claude's remote MCP connector.
+const authorizationServerMetadata = {
+  issuer: BASE_URL,
+  authorization_endpoint: `${BASE_URL}/authorize`,
+  token_endpoint: `${BASE_URL}/token`,
+  registration_endpoint: `${BASE_URL}/register`,
+  response_types_supported: ["code"],
+  response_modes_supported: ["query"],
+  grant_types_supported: ["authorization_code"],
+  token_endpoint_auth_methods_supported: ["none"],
+  code_challenge_methods_supported: ["S256"],
+  scopes_supported: ["youtube.readonly", "youtube.upload"]
+};
+const protectedResourceMetadata = {
+  resource: MCP_RESOURCE,
+  authorization_servers: [BASE_URL],
+  bearer_methods_supported: ["header"],
+  scopes_supported: ["youtube.readonly", "youtube.upload"]
+};
+app.get("/.well-known/oauth-authorization-server", (_req, res) => res.json(authorizationServerMetadata));
+app.get("/.well-known/oauth-protected-resource", (_req, res) => res.json(protectedResourceMetadata));
+app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => res.json(protectedResourceMetadata));
 
-function authorized(req, res, next) {
-  if (!MCP_ACCESS_TOKEN) {
-    return res.status(503).json({ error: "MCP_ACCESS_TOKEN is not configured." });
+// Dynamic client registration. Claude creates its own public OAuth client.
+app.post("/register", (req, res) => {
+  const body = req.body || {};
+  const redirects = body.redirect_uris;
+  if (!Array.isArray(redirects) || redirects.length === 0 ||
+      redirects.some((u) => typeof u !== "string" || !(u.startsWith("https://") || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(u)))) {
+    return oauthError(res, "invalid_client_metadata", "A valid redirect_uris array is required.");
   }
-  const header = req.get("authorization") || "";
-  const supplied = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const a = Buffer.from(supplied);
-  const b = Buffer.from(MCP_ACCESS_TOKEN);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) {
-    return res.status(401).set("WWW-Authenticate", "Bearer").json({ error: "Unauthorized" });
+  const clientId = crypto.randomUUID();
+  const client = {
+    client_id: clientId,
+    client_name: typeof body.client_name === "string" ? body.client_name.slice(0, 120) : "MCP client",
+    redirect_uris: redirects,
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code"],
+    response_types: ["code"]
+  };
+  clients.set(clientId, client);
+  return res.status(201).json(client);
+});
+
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, response_type, state, code_challenge, code_challenge_method } = req.query;
+  const client = clients.get(String(client_id || ""));
+  if (!client || !client.redirect_uris.includes(String(redirect_uri || ""))) {
+    return oauthError(res, "invalid_request", "Unknown client or redirect URI.");
   }
+  if (response_type !== "code" || !state || !code_challenge || code_challenge_method !== "S256") {
+    return oauthError(res, "invalid_request", "Authorization Code with PKCE S256 is required.");
+  }
+  const resource = String(req.query.resource || MCP_RESOURCE);
+  if (resource !== MCP_RESOURCE) return oauthError(res, "invalid_target", "Unknown resource.");
+  const txn = crypto.randomBytes(24).toString("base64url");
+  pendingAuthorizations.set(txn, {
+    client_id: String(client_id), redirect_uri: String(redirect_uri),
+    state: String(state), code_challenge: String(code_challenge),
+    resource, created_at: Date.now()
+  });
+  const safeName = String(client.client_name).replace(/[&<>"']/g, "");
+  res.type("html").send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>EpicRush authorization</title><style>body{font-family:Arial,sans-serif;background:#f4f7fb;display:grid;place-items:center;min-height:100vh;margin:0;color:#172033}.card{background:white;padding:28px;border-radius:18px;max-width:420px;width:calc(100% - 56px);box-shadow:0 10px 40px #15294b18}input{box-sizing:border-box;width:100%;padding:13px;border:1px solid #ccd4e0;border-radius:9px;margin:12px 0}button{width:100%;padding:13px;border:0;border-radius:9px;background:#2563eb;color:white;font-weight:700}small{color:#64748b}</style></head><body><main class="card"><h2>Connect EpicRush YouTube</h2><p><b>${safeName}</b> wants permission to use your YouTube channel through EpicRush.</p><p>Requested access: read channel details and upload videos.</p><form method="post" action="/authorize/decision"><input type="hidden" name="txn" value="${txn}"><label>EpicRush connection password</label><input type="password" name="password" required autocomplete="current-password" placeholder="Enter the password set in Render"><button type="submit">Approve connection</button></form><small>This password is checked by EpicRush and is not sent to Claude.</small></main></body></html>`);
+});
+
+app.post("/authorize/decision", (req, res) => {
+  const txn = String(req.body.txn || "");
+  const pending = pendingAuthorizations.get(txn);
+  pendingAuthorizations.delete(txn);
+  if (!pending || Date.now() - pending.created_at > 10 * 60 * 1000) {
+    return res.status(400).type("text").send("Authorization expired. Please reconnect from Claude.");
+  }
+  if (!ADMIN_PASSWORD || !safeEqual(String(req.body.password || ""), ADMIN_PASSWORD)) {
+    return res.status(401).type("text").send("Incorrect connection password. Go back to Claude and try connecting again.");
+  }
+  const code = crypto.randomBytes(32).toString("base64url");
+  authorizationCodes.set(code, { ...pending, created_at: Date.now() });
+  const target = new URL(pending.redirect_uri);
+  target.searchParams.set("code", code);
+  target.searchParams.set("state", pending.state);
+  return res.redirect(302, target.toString());
+});
+
+app.post("/token", (req, res) => {
+  const { grant_type, code, redirect_uri, client_id, code_verifier } = req.body || {};
+  if (grant_type !== "authorization_code") return oauthError(res, "unsupported_grant_type", "Only authorization_code is supported.");
+  const record = authorizationCodes.get(String(code || ""));
+  authorizationCodes.delete(String(code || ""));
+  if (!record || Date.now() - record.created_at > 5 * 60 * 1000) return oauthError(res, "invalid_grant", "Authorization code is invalid or expired.");
+  if (record.client_id !== String(client_id || "") || record.redirect_uri !== String(redirect_uri || "")) {
+    return oauthError(res, "invalid_grant", "Client or redirect URI does not match.");
+  }
+  if (typeof code_verifier !== "string" || code_verifier.length < 43 || code_verifier.length > 128) {
+    return oauthError(res, "invalid_grant", "PKCE verifier is invalid.");
+  }
+  const digest = crypto.createHash("sha256").update(code_verifier).digest("base64url");
+  if (!safeEqual(digest, record.code_challenge)) return oauthError(res, "invalid_grant", "PKCE verification failed.");
+  const now = Math.floor(Date.now() / 1000);
+  const accessToken = signJwt({
+    iss: BASE_URL, sub: record.client_id, aud: MCP_RESOURCE,
+    scope: "youtube.readonly youtube.upload", iat: now, exp: now + 3600
+  });
+  return res.json({
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: 3600,
+    scope: "youtube.readonly youtube.upload"
+  });
+});
+
+function requireOAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  const claims = match ? verifyJwt(match[1]) : null;
+  if (!claims) {
+    res.set("WWW-Authenticate", `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`);
+    return res.status(401).json({ error: "Unauthorized", message: "Use Claude's EpicRush OAuth connection." });
+  }
+  req.oauthClaims = claims;
   next();
 }
 
-app.get("/", (_req, res) => {
-  res.type("html").send(html("<h1>EpicRush YouTube MCP</h1><p>Server is running.</p><p>Health: <a href='/health'>/health</a></p><p>Google setup: <a href='/google/auth'>/google/auth</a></p><p>MCP endpoint: <code>/mcp</code></p>"));
-});
-
-app.get("/health", (_req, res) => res.json({ ok: true, service: "epicrush-youtube-mcp" }));
-
-app.get("/google/auth", (req, res) => {
+// Separate Google OAuth: this authorizes EpicRush to access the user's YouTube channel.
+app.get("/google/auth", (_req, res) => {
   try {
-    const oauth2 = getOAuthClient(getRedirectUri(req));
-    const url = oauth2.generateAuthUrl({
+    const oauth = getOAuthClient();
+    const url = oauth.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
-      scope: ["https://www.googleapis.com/auth/youtube.upload"]
+      scope: ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"]
     });
     res.redirect(url);
-  } catch (error) {
-    res.status(500).type("html").send(html(`<h1>Google OAuth setup error</h1><p>${String(error.message)}</p>`));
-  }
+  } catch (error) { res.status(500).type("text").send(error.message); }
 });
-
 app.get("/google/callback", async (req, res) => {
   try {
-    if (req.query.error) {
-      return res.status(400).type("html").send(html(`<h1>Google authorization was not completed</h1><p>${String(req.query.error)}</p>`));
-    }
-    const code = String(req.query.code || "");
-    if (!code) return res.status(400).send("Missing OAuth code.");
-    const oauth2 = getOAuthClient(getRedirectUri(req));
-    const { tokens } = await oauth2.getToken(code);
-    if (!tokens.refresh_token) {
-      return res.status(400).type("html").send(html("<h1>No refresh token returned</h1><p>Revoke this app's access in your Google Account, then visit /google/auth again and approve consent.</p>"));
-    }
-    res.set("Cache-Control", "no-store");
-    res.type("html").send(html(`
-      <h1>EpicRush YouTube authorization successful</h1>
-      <p>Copy the refresh token below into your hosting provider's environment variable named <b>YOUTUBE_REFRESH_TOKEN</b>.</p>
-      <p><b>Do not share this token or put it in GitHub.</b></p>
-      <textarea id="token" style="width:100%;height:120px">${tokens.refresh_token}</textarea>
-      <p><button onclick="navigator.clipboard.writeText(document.getElementById('token').value)">Copy refresh token</button></p>
-      <p>After saving it in the host, you can close this page.</p>
-    `));
-  } catch (error) {
-    res.status(500).type("html").send(html(`<h1>OAuth callback failed</h1><p>${String(error.message)}</p>`));
-  }
+    const oauth = getOAuthClient();
+    const { tokens } = await oauth.getToken(String(req.query.code || ""));
+    res.type("html").send(`<h2>Google authorization complete</h2><p>Copy the refresh token below into the Render environment variable <b>YOUTUBE_REFRESH_TOKEN</b>. Keep it secret.</p><textarea style="width:95%;height:110px">${String(tokens.refresh_token || "No refresh token returned. Revoke access and authorize again with consent.")}</textarea><p>After saving the variable in Render, redeploy the service.</p>`);
+  } catch (error) { res.status(500).type("text").send(`Google OAuth failed: ${error.message}`); }
 });
 
-function createMcpServer() {
-  const server = new McpServer({ name: "epicrush-youtube-mcp", version: "1.0.0" });
+function getYouTube() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !YOUTUBE_REFRESH_TOKEN) {
+    throw new Error("Missing GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or YOUTUBE_REFRESH_TOKEN in Render.");
+  }
+  const oauth = getOAuthClient();
+  oauth.setCredentials({ refresh_token: YOUTUBE_REFRESH_TOKEN });
+  return google.youtube({ version: "v3", auth: oauth });
+}
 
-  server.tool(
-    "epicrush_channel_info",
-    "Show the YouTube channel connected to EpicRush. This only reads channel details.",
-    {},
-    async () => {
-      try {
-        const yt = youtubeClient();
-        const response = await yt.channels.list({ part: ["snippet", "statistics"], mine: true });
-        const channel = response.data.items?.[0];
-        if (!channel) return { content: [{ type: "text", text: "No channel was returned. Check that the Google account authorized is the owner of @epicrushworld." }] };
-        return { content: [{ type: "text", text: JSON.stringify({
-          title: channel.snippet?.title,
-          channelId: channel.id,
-          customUrl: channel.snippet?.customUrl,
-          subscribers: channel.statistics?.subscriberCount,
-          videos: channel.statistics?.videoCount,
-          views: channel.statistics?.viewCount
-        }, null, 2) }] };
-      } catch (error) {
-        return { isError: true, content: [{ type: "text", text: `YouTube channel check failed: ${error.message}` }] };
-      }
+function createMcpServer() {
+  const server = new McpServer({ name: "EpicRush YouTube", version: "2.0.0" });
+
+  server.tool("epicrush_channel_info", "Get the connected YouTube channel's basic information.", {}, async () => {
+    try {
+      const yt = getYouTube();
+      const response = await yt.channels.list({ part: ["snippet", "statistics"], mine: true });
+      const channel = response.data.items?.[0];
+      if (!channel) return { content: [{ type: "text", text: "No YouTube channel was returned. Recheck the Google account and YouTube permissions." }] };
+      return { content: [{ type: "text", text: JSON.stringify({
+        title: channel.snippet?.title,
+        channelId: channel.id,
+        customUrl: channel.snippet?.customUrl,
+        subscribers: channel.statistics?.subscriberCount,
+        totalViews: channel.statistics?.viewCount,
+        videoCount: channel.statistics?.videoCount
+      }, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `YouTube channel lookup failed: ${error.message}` }], isError: true };
     }
-  );
+  });
 
   server.tool(
     "epicrush_upload_video",
-    "Upload a video file from a publicly reachable direct HTTPS MP4 URL to the connected YouTube channel. Use private by default and ask the channel owner before public publishing.",
+    "Upload an existing MP4 video from a direct public HTTPS URL to the connected YouTube channel.",
     {
-      video_url: z.string().url().describe("Direct HTTPS URL to an MP4 video file; not a YouTube watch page or Google Drive preview page."),
+      video_url: z.string().url().describe("Direct public HTTPS URL to an MP4 file"),
       title: z.string().min(1).max(100),
-      description: z.string().max(5000).default(""),
-      tags: z.array(z.string().max(30)).max(20).default([]),
+      description: z.string().max(5000).optional(),
+      tags: z.array(z.string().max(100)).max(30).optional(),
       privacy_status: z.enum(["private", "unlisted", "public"]).default("private"),
       made_for_kids: z.boolean().default(false)
     },
-    async ({ video_url, title, description, tags, privacy_status, made_for_kids }) => {
+    async ({ video_url, title, description = "", tags = [], privacy_status = "private", made_for_kids = false }) => {
       try {
         const parsed = new URL(video_url);
         if (parsed.protocol !== "https:") throw new Error("Only HTTPS video URLs are allowed.");
-        const videoResponse = await fetch(parsed, { redirect: "follow" });
-        if (!videoResponse.ok || !videoResponse.body) throw new Error(`Could not fetch video URL (HTTP ${videoResponse.status}).`);
-        const contentType = videoResponse.headers.get("content-type") || "";
-        if (!contentType.includes("video") && !contentType.includes("octet-stream")) {
-          throw new Error(`URL did not return a video file (content-type: ${contentType || "unknown"}). Use a direct MP4 download URL.`);
-        }
-        const yt = youtubeClient();
-        const result = await yt.videos.insert({
+        const response = await fetch(parsed, { redirect: "follow" });
+        if (!response.ok || !response.body) throw new Error(`Could not download video (HTTP ${response.status}).`);
+        const contentType = response.headers.get("content-type") || "";
+        if (!contentType.toLowerCase().includes("video/mp4")) throw new Error("URL must return a direct video/mp4 file.");
+        const yt = getYouTube();
+        const uploaded = await yt.videos.insert({
           part: ["snippet", "status"],
           requestBody: {
-            snippet: { title, description, tags, categoryId: "24" },
+            snippet: { title, description, tags },
             status: { privacyStatus: privacy_status, selfDeclaredMadeForKids: made_for_kids }
           },
-          media: {
-            mimeType: contentType.includes("video") ? contentType : "video/mp4",
-            body: Readable.fromWeb(videoResponse.body)
-          }
+          media: { body: Readable.fromWeb(response.body) }
         });
         return { content: [{ type: "text", text: JSON.stringify({
-          uploaded: true,
-          videoId: result.data.id,
-          title: result.data.snippet?.title,
-          privacyStatus: result.data.status?.privacyStatus,
-          watchUrl: `https://www.youtube.com/watch?v=${result.data.id}`
+          success: true, videoId: uploaded.data.id,
+          url: `https://www.youtube.com/watch?v=${uploaded.data.id}`,
+          privacyStatus: uploaded.data.status?.privacyStatus
         }, null, 2) }] };
       } catch (error) {
-        return { isError: true, content: [{ type: "text", text: `Video upload failed: ${error.message}` }] };
+        return { content: [{ type: "text", text: `YouTube upload failed: ${error.message}` }], isError: true };
       }
     }
   );
-
   return server;
 }
 
-app.post("/mcp", authorized, async (req, res) => {
+app.post("/mcp", requireOAuth, async (req, res) => {
   const server = createMcpServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  res.on("close", () => {
-    transport.close();
-    server.close();
-  });
+  res.on("close", () => { transport.close(); server.close(); });
   try {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    if (!res.headersSent) res.status(500).json({ error: "MCP request failed", details: error.message });
+    console.error("MCP request failed:", error);
+    if (!res.headersSent) res.status(500).json({ error: "MCP request failed" });
   }
 });
+app.get("/mcp", requireOAuth, (_req, res) => res.status(405).send("Method not allowed"));
+app.delete("/mcp", requireOAuth, (_req, res) => res.status(405).send("Method not allowed"));
 
-app.get("/mcp", authorized, (_req, res) => {
-  res.status(405).set("Allow", "POST").send("Use POST for the Streamable HTTP MCP endpoint.");
-});
-
-app.delete("/mcp", authorized, (_req, res) => res.status(405).send("Stateless MCP endpoint."));
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`EpicRush YouTube MCP listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`EpicRush YouTube MCP OAuth server listening on port ${PORT}`));

@@ -1,90 +1,42 @@
-# EpicRush YouTube MCP
+# EpicRush YouTube MCP (OAuth version)
 
-A small remote MCP server that connects Claude to the YouTube channel authorized by the owner.
+This version uses an OAuth 2.1 Authorization Code + PKCE flow for Claude's remote MCP connector. Google OAuth remains separate and is used only to access the YouTube channel.
 
-## Tools
+## Render environment variables
 
-- `epicrush_channel_info`: reads the connected YouTube channel details.
-- `epicrush_upload_video`: uploads a video from a publicly reachable direct HTTPS video URL. Upload defaults to `private`.
+Keep these in Render Environment, never in GitHub:
 
-This server does **not** generate cartoon videos or host large video files. Create/edit the video with your chosen editor or AI tools, place the MP4 at a direct-download HTTPS URL, then ask Claude to upload it.
+- `PUBLIC_BASE_URL` = `https://epicrush-youtube-mcp.onrender.com`
+- `MCP_OAUTH_SIGNING_SECRET` = a newly generated random secret (at least 32 characters)
+- `MCP_OAUTH_ADMIN_PASSWORD` = a strong private password you choose; Claude's connection approval page will ask for it
+- `GOOGLE_CLIENT_ID` = existing Google OAuth client ID
+- `GOOGLE_CLIENT_SECRET` = existing Google OAuth client secret
+- `YOUTUBE_REFRESH_TOKEN` = existing YouTube refresh token
 
-## Requirements
+Do not use the old `MCP_ACCESS_TOKEN`; this OAuth version does not need it.
 
-- Node.js 20+
-- Google Cloud project with YouTube Data API v3 enabled
-- Google OAuth **Web application** client
-- A public HTTPS host (Render free web services can be used for testing; they sleep after 15 minutes idle and have an ephemeral filesystem)
-- Claude custom connector support
+## Deploy
 
-## 1. Deploy to Render
+1. Replace the repository files with the files in this ZIP.
+2. Commit/push to the existing GitHub repository's `main` branch.
+3. In Render, add the two new variables `MCP_OAUTH_SIGNING_SECRET` and `MCP_OAUTH_ADMIN_PASSWORD`. Keep the existing Google variables.
+4. Confirm `PUBLIC_BASE_URL` is correct, then deploy.
+5. Check `https://epicrush-youtube-mcp.onrender.com/health`.
+6. Open `https://epicrush-youtube-mcp.onrender.com/google/auth` once and authorize the Google account that owns the YouTube channel. This version requests both `youtube.upload` and `youtube.readonly`. If Google returns a new refresh token, update `YOUTUBE_REFRESH_TOKEN` in Render and redeploy.
+7. In Claude, add a custom connector:
+   - Name: `EpicRush YouTube`
+   - URL: `https://epicrush-youtube-mcp.onrender.com/mcp`
+   - Choose OAuth / Sign in when prompted (do not select No sign-in and do not add a Bearer header).
+8. Claude should open the EpicRush approval page. Enter the `MCP_OAUTH_ADMIN_PASSWORD` you set in Render and approve.
 
-1. Push this repository to GitHub.
-2. In Render, choose **New → Web Service**, connect this GitHub repository.
-3. Runtime: Node. Build command: `npm install`. Start command: `npm start`.
-4. Select Free for testing.
-5. After deployment, copy the service URL, e.g. `https://YOUR-SERVICE.onrender.com`.
+## Available tools
 
-## 2. Configure Google OAuth redirect
+- `epicrush_channel_info`
+- `epicrush_upload_video` (uploads an existing public HTTPS MP4 URL; default privacy is private)
 
-In Google Cloud Console → Google Auth Platform / Clients → your Web client:
+## Important security notes
 
-- Add this exact Authorized redirect URI:
-  `https://YOUR-SERVICE.onrender.com/google/callback`
-- Save changes.
-
-Do not add a guessed URL. Use the actual Render service URL.
-
-## 3. Set Render environment variables
-
-In Render → your service → Environment, add:
-
-- `GOOGLE_CLIENT_ID` = OAuth client ID
-- `GOOGLE_CLIENT_SECRET` = OAuth client secret
-- `MCP_ACCESS_TOKEN` = a long random secret (32+ characters)
-- `PORT` is supplied by Render; do not need to set it.
-
-Save and redeploy.
-
-## 4. Connect the YouTube channel
-
-1. Open `https://YOUR-SERVICE.onrender.com/google/auth`.
-2. Sign in with the Google account that owns the EpicRush channel.
-3. Review and approve the `youtube.upload` permission.
-4. The callback page displays a refresh token once.
-5. Copy it immediately into Render Environment as `YOUTUBE_REFRESH_TOKEN`.
-6. Save/redeploy. Never put this token in GitHub or share it in chat.
-
-If no refresh token appears, revoke this app's access from your Google Account and repeat the consent flow.
-
-## 5. Add to Claude
-
-In Claude → Settings / Customize → Connectors → Add custom connector:
-
-- Name: `EpicRush YouTube`
-- Server URL: `https://YOUR-SERVICE.onrender.com/mcp`
-- Choose the fixed request-header authentication option if available:
-  - Header: `Authorization`
-  - Value: `Bearer YOUR_MCP_ACCESS_TOKEN`
-
-If Claude's UI does not offer request headers, do not disable server authentication or publish an unauthenticated upload endpoint. Stop and ask for a different secure auth setup.
-
-## 6. Test safely
-
-First call `epicrush_channel_info` and confirm it shows the intended channel.
-
-For upload, use a direct HTTPS MP4 download URL (not a YouTube link or Drive preview page). Keep `privacy_status` as `private` for the first test. Check the result in YouTube Studio before changing privacy to public.
-
-## Security
-
-- Never commit `.env`, client secrets, access tokens, refresh tokens, or downloaded credential JSON files.
-- Keep the GitHub repository private if desired, but still never commit secrets.
-- Anyone with the MCP access token can use the connected YouTube upload permission.
-- Revoke Google access and rotate the MCP token if either is exposed.
-- Review each title, description, thumbnail, audience setting, and video before publishing.
-
-## Important limitations
-
-- Render's free web services sleep after 15 minutes without inbound traffic and have ephemeral local storage. This is suitable for a test, not guaranteed always-on automation.
-- YouTube API upload quotas and Google OAuth verification restrictions may apply. New/unverified API projects may have upload limitations.
-- This server uploads an existing video; it does not generate animation, narration, music, or captions.
+- Never share or commit Google client secrets, refresh tokens, signing secrets, or the connection password.
+- Use a new random signing secret. Do not reuse the previously shared MCP bearer token.
+- OAuth client registrations and pending authorization codes are held in memory. If Render restarts during the initial authorization flow, simply reconnect from Claude. Access tokens are self-contained and expire after one hour.
+- The free Render instance may sleep when idle, so the first request can take a little time to wake up.
